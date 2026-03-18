@@ -100,3 +100,5 @@ AVX512_TriDist_TriInt_3——版本3，VScode，AVX512向量化
 AVX512_TriDist_TriInt_4——版本4，Linux，无AVX512
 
 AVX512_TriDist_TriInt_5——版本5，Linux，AVX512
+
+AVX512_TriDist_TriInt_6——版本6，Linux，AVX512，数据对齐/数据预取
