@@ -1,18 +1,20 @@
 //--------------------------------------------------------------------------
-// 文件: TriDist.cpp (AVX512优化版 - 批处理 n=16 + SoA)
+// 文件: TriDist.cpp (AVX512优化版 - 批处理 n=16 + SoA) - 优化版本
 // 描述: 同时处理16对三角形的距离计算，使用AVX512指令集加速
+//       新增: 数据结构64字节对齐，关键内存预取
 //--------------------------------------------------------------------------
 
 #include <cstring>
 #include <cmath>
+#include <cstdint>
 #include <algorithm>
 #include <cfloat>
 #include <immintrin.h>
 
 typedef float PQP_REAL;
 
-// ========== SoA数据结构 ==========
-struct TriangleBatch16
+// ========== SoA数据结构（64字节对齐） ==========
+struct alignas(64) TriangleBatch16
 {
     float S0_x[16], S0_y[16], S0_z[16];
     float S1_x[16], S1_y[16], S1_z[16];
@@ -41,7 +43,7 @@ struct TriangleBatch16
     float dist[16];
 };
 
-struct EdgePairResults16
+struct alignas(64) EdgePairResults16
 {
     float P_x[9][16], P_y[9][16], P_z[9][16];
     float Q_x[9][16], Q_y[9][16], Q_z[9][16];
@@ -57,15 +59,30 @@ struct EdgePairResults16
     }
 };
 
-// ========== AVX512辅助函数 ==========
-static inline __m512 load_ps(const float *ptr)
+// ========== AVX512辅助函数（智能加载 - 自动处理对齐） ==========
+
+// 检查地址是否64字节对齐
+static inline bool is_aligned64(const void *ptr)
 {
-    return _mm512_loadu_ps(ptr);
+    return ((uintptr_t)ptr & 63) == 0;
 }
 
+// 安全加载：自动选择对齐或非对齐指令
+static inline __m512 load_ps(const float *ptr)
+{
+    if (is_aligned64(ptr))
+        return _mm512_load_ps(ptr);
+    else
+        return _mm512_loadu_ps(ptr); // 非对齐fallback
+}
+
+// 安全存储：自动选择对齐或非对齐指令
 static inline void store_ps(float *ptr, __m512 val)
 {
-    _mm512_storeu_ps(ptr, val);
+    if (is_aligned64(ptr))
+        _mm512_store_ps(ptr, val);
+    else
+        _mm512_storeu_ps(ptr, val); // 非对齐fallback
 }
 
 // 批量点积
@@ -207,7 +224,7 @@ static void compute_edge_vectors_batch16(TriangleBatch16 &batch)
     length2_batch16_avx512(batch.Tnl2, batch.Tn_x, batch.Tn_y, batch.Tn_z);
 }
 
-// ========== 计算线段最近点 ==========
+// ========== 计算线段最近点（所有临时数组对齐） ==========
 static void SegPointsBatch16_avx512(
     float *VEC_x, float *VEC_y, float *VEC_z,
     float *X_x, float *X_y, float *X_z,
@@ -217,12 +234,15 @@ static void SegPointsBatch16_avx512(
     const float *Q_x, const float *Q_y, const float *Q_z,
     const float *B_x, const float *B_y, const float *B_z)
 {
+    // 所有临时数组均按64字节对齐
+    alignas(64) float T_x[16], T_y[16], T_z[16];
+    alignas(64) float A_dot_A[16], B_dot_B[16], A_dot_B[16], A_dot_T[16], B_dot_T[16];
+    alignas(64) float denom[16];
+
     // 计算 T = Q - P
-    float T_x[16], T_y[16], T_z[16];
     vec_sub_batch16_avx512(T_x, T_y, T_z, Q_x, Q_y, Q_z, P_x, P_y, P_z);
 
     // 计算点积
-    float A_dot_A[16], B_dot_B[16], A_dot_B[16], A_dot_T[16], B_dot_T[16];
     dotprod_batch16_avx512(A_dot_A, A_x, A_y, A_z, A_x, A_y, A_z);
     dotprod_batch16_avx512(B_dot_B, B_x, B_y, B_z, B_x, B_y, B_z);
     dotprod_batch16_avx512(A_dot_B, A_x, A_y, A_z, B_x, B_y, B_z);
@@ -230,7 +250,6 @@ static void SegPointsBatch16_avx512(
     dotprod_batch16_avx512(B_dot_T, B_x, B_y, B_z, T_x, T_y, T_z);
 
     // 计算分母
-    float denom[16];
     {
         __m512 a_dot_a = load_ps(A_dot_A);
         __m512 b_dot_b = load_ps(B_dot_B);
@@ -281,9 +300,9 @@ static void SegPointsBatch16_avx512(
     // 处理退化情况（使用标量回退，因为退化情况很少）
     if (degen_mask != 0)
     {
-        float t_vals[16], u_vals[16];
-        _mm512_storeu_ps(t_vals, t_normal);
-        _mm512_storeu_ps(u_vals, u_normal);
+        alignas(64) float t_vals[16], u_vals[16];
+        _mm512_store_ps(t_vals, t_normal);
+        _mm512_store_ps(u_vals, u_normal);
 
         for (int i = 0; i < 16; i++)
         {
@@ -315,48 +334,96 @@ static void SegPointsBatch16_avx512(
                 t_vals[i] = best_t;
                 u_vals[i] = best_u;
             }
+            else
+            {
+                // 非退化情况：先约束 t
+                float t = t_vals[i];
+                float u = u_vals[i];
+
+                // 约束 t 到 [0, 1]
+                if (t < 0)
+                {
+                    t = 0;
+                    if (fabs(B_dot_B[i]) > 1e-15f)
+                        u = -B_dot_T[i] / B_dot_B[i];
+                }
+                else if (t > 1)
+                {
+                    t = 1;
+                    if (fabs(B_dot_B[i]) > 1e-15f)
+                        u = (A_dot_B[i] - B_dot_T[i]) / B_dot_B[i];
+                }
+
+                // 约束 u 到 [0, 1]
+                if (u < 0)
+                {
+                    u = 0;
+                    if (fabs(A_dot_A[i]) > 1e-15f)
+                        t = A_dot_T[i] / A_dot_A[i];
+                    if (t < 0)
+                        t = 0;
+                    if (t > 1)
+                        t = 1;
+                }
+                else if (u > 1)
+                {
+                    u = 1;
+                    if (fabs(A_dot_A[i]) > 1e-15f)
+                        t = (A_dot_T[i] + A_dot_B[i]) / A_dot_A[i];
+                    if (t < 0)
+                        t = 0;
+                    if (t > 1)
+                        t = 1;
+                }
+
+                t_vals[i] = t;
+                u_vals[i] = u;
+            }
         }
 
         t = load_ps(t_vals);
         u = load_ps(u_vals);
     }
+    else
+    {
+        // 非退化情况：批量处理边界约束
+        // 约束参数（完整版本，与标量逻辑一致）
+        // 首先处理 t 的边界情况
+        __mmask16 t_lower = _mm512_cmp_ps_mask(t, zero, _CMP_LT_OS);
+        __mmask16 t_upper = _mm512_cmp_ps_mask(t, one, _CMP_GT_OS);
 
-    // 约束参数（完整版本，与标量逻辑一致）
-    // 首先处理 t 的边界情况
-    __mmask16 t_lower = _mm512_cmp_ps_mask(t, zero, _CMP_LT_OS);
-    __mmask16 t_upper = _mm512_cmp_ps_mask(t, one, _CMP_GT_OS);
+        // 当 t < 0 时，t = 0，重新计算 u
+        __m512 b_dot_b_safe = _mm512_mask_mov_ps(b_dot_b,
+                                                 _mm512_cmp_ps_mask(_mm512_castsi512_ps(_mm512_and_si512(_mm512_castps_si512(b_dot_b), _mm512_set1_epi32(0x7FFFFFFF))), eps, _CMP_LT_OS),
+                                                 _mm512_set1_ps(1.0f)); // 避免除以零
+        __m512 u_new_t0 = _mm512_div_ps(_mm512_sub_ps(zero, b_dot_t), b_dot_b_safe);
+        u = _mm512_mask_mov_ps(u, t_lower, u_new_t0);
+        t = _mm512_mask_mov_ps(t, t_lower, zero);
 
-    // 当 t < 0 时，t = 0，重新计算 u
-    __m512 b_dot_b_safe = _mm512_mask_mov_ps(b_dot_b,
-                                             _mm512_cmp_ps_mask(_mm512_castsi512_ps(_mm512_and_si512(_mm512_castps_si512(b_dot_b), _mm512_set1_epi32(0x7FFFFFFF))), eps, _CMP_LT_OS),
-                                             _mm512_set1_ps(1.0f)); // 避免除以零
-    __m512 u_new_t0 = _mm512_div_ps(_mm512_sub_ps(zero, b_dot_t), b_dot_b_safe);
-    u = _mm512_mask_mov_ps(u, t_lower, u_new_t0);
-    t = _mm512_mask_mov_ps(t, t_lower, zero);
+        // 当 t > 1 时，t = 1，重新计算 u
+        __m512 u_new_t1 = _mm512_div_ps(_mm512_sub_ps(a_dot_b, b_dot_t), b_dot_b_safe);
+        u = _mm512_mask_mov_ps(u, t_upper, u_new_t1);
+        t = _mm512_mask_mov_ps(t, t_upper, one);
 
-    // 当 t > 1 时，t = 1，重新计算 u
-    __m512 u_new_t1 = _mm512_div_ps(_mm512_sub_ps(a_dot_b, b_dot_t), b_dot_b_safe);
-    u = _mm512_mask_mov_ps(u, t_upper, u_new_t1);
-    t = _mm512_mask_mov_ps(t, t_upper, one);
+        // 然后处理 u 的边界情况
+        __mmask16 u_lower = _mm512_cmp_ps_mask(u, zero, _CMP_LT_OS);
+        __mmask16 u_upper = _mm512_cmp_ps_mask(u, one, _CMP_GT_OS);
 
-    // 然后处理 u 的边界情况
-    __mmask16 u_lower = _mm512_cmp_ps_mask(u, zero, _CMP_LT_OS);
-    __mmask16 u_upper = _mm512_cmp_ps_mask(u, one, _CMP_GT_OS);
+        // 当 u < 0 时，u = 0，重新计算 t
+        __m512 a_dot_a_safe = _mm512_mask_mov_ps(a_dot_a,
+                                                 _mm512_cmp_ps_mask(_mm512_castsi512_ps(_mm512_and_si512(_mm512_castps_si512(a_dot_a), _mm512_set1_epi32(0x7FFFFFFF))), eps, _CMP_LT_OS),
+                                                 _mm512_set1_ps(1.0f)); // 避免除以零
+        __m512 t_new_u0 = _mm512_div_ps(a_dot_t, a_dot_a_safe);
+        t_new_u0 = _mm512_min_ps(_mm512_max_ps(t_new_u0, zero), one);
+        t = _mm512_mask_mov_ps(t, u_lower, t_new_u0);
+        u = _mm512_mask_mov_ps(u, u_lower, zero);
 
-    // 当 u < 0 时，u = 0，重新计算 t
-    __m512 a_dot_a_safe = _mm512_mask_mov_ps(a_dot_a,
-                                             _mm512_cmp_ps_mask(_mm512_castsi512_ps(_mm512_and_si512(_mm512_castps_si512(a_dot_a), _mm512_set1_epi32(0x7FFFFFFF))), eps, _CMP_LT_OS),
-                                             _mm512_set1_ps(1.0f)); // 避免除以零
-    __m512 t_new_u0 = _mm512_div_ps(a_dot_t, a_dot_a_safe);
-    t_new_u0 = _mm512_min_ps(_mm512_max_ps(t_new_u0, zero), one);
-    t = _mm512_mask_mov_ps(t, u_lower, t_new_u0);
-    u = _mm512_mask_mov_ps(u, u_lower, zero);
-
-    // 当 u > 1 时，u = 1，重新计算 t
-    __m512 t_new_u1 = _mm512_div_ps(_mm512_add_ps(a_dot_t, a_dot_b), a_dot_a_safe);
-    t_new_u1 = _mm512_min_ps(_mm512_max_ps(t_new_u1, zero), one);
-    t = _mm512_mask_mov_ps(t, u_upper, t_new_u1);
-    u = _mm512_mask_mov_ps(u, u_upper, one);
+        // 当 u > 1 时，u = 1，重新计算 t
+        __m512 t_new_u1 = _mm512_div_ps(_mm512_add_ps(a_dot_t, a_dot_b), a_dot_a_safe);
+        t_new_u1 = _mm512_min_ps(_mm512_max_ps(t_new_u1, zero), one);
+        t = _mm512_mask_mov_ps(t, u_upper, t_new_u1);
+        u = _mm512_mask_mov_ps(u, u_upper, one);
+    }
 
     // 最终截断（确保在 [0,1] 范围内）
     __m512 t_clamped = _mm512_min_ps(_mm512_max_ps(t, zero), one);
@@ -516,11 +583,11 @@ static void compute_edge_pair_batch16_avx512(
         break;
     }
 
-    float ZS_minus_P_x[16], ZS_minus_P_y[16], ZS_minus_P_z[16];
+    alignas(64) float ZS_minus_P_x[16], ZS_minus_P_y[16], ZS_minus_P_z[16];
     vec_sub_batch16_avx512(ZS_minus_P_x, ZS_minus_P_y, ZS_minus_P_z,
                            ZS_x, ZS_y, ZS_z, P_x, P_y, P_z);
 
-    float ZT_minus_Q_x[16], ZT_minus_Q_y[16], ZT_minus_Q_z[16];
+    alignas(64) float ZT_minus_Q_x[16], ZT_minus_Q_y[16], ZT_minus_Q_z[16];
     vec_sub_batch16_avx512(ZT_minus_Q_x, ZT_minus_Q_y, ZT_minus_Q_z,
                            ZT_x, ZT_y, ZT_z, Q_x, Q_y, Q_z);
 
@@ -532,7 +599,7 @@ static void compute_edge_pair_batch16_avx512(
                            ZT_minus_Q_x, ZT_minus_Q_y, ZT_minus_Q_z,
                            results.vec_x[edge_idx], results.vec_y[edge_idx], results.vec_z[edge_idx]);
 
-    float V_x[16], V_y[16], V_z[16];
+    alignas(64) float V_x[16], V_y[16], V_z[16];
     vec_sub_batch16_avx512(V_x, V_y, V_z, Q_x, Q_y, Q_z, P_x, P_y, P_z);
 
     dotprod_batch16_avx512(results.p[edge_idx],
@@ -558,7 +625,7 @@ static void compute_edge_pair_batch16_avx512(
     }
 }
 
-// ========== 选择最优最近点 ==========
+// ========== 选择最优最近点（添加预取） ==========
 static void select_best_points_batch16_avx512(
     const EdgePairResults16 &results,
     float P_x[16], float P_y[16], float P_z[16],
@@ -576,6 +643,10 @@ static void select_best_points_batch16_avx512(
 
     for (int edge = 0; edge < 9; edge++)
     {
+        // 预取下一边的结果（如果有）
+        if (edge + 1 < 9)
+            _mm_prefetch((const char *)results.dist2[edge + 1], _MM_HINT_T0);
+
         __m512 edge_dist = load_ps(results.dist2[edge]);
         __m512 edge_p_x = load_ps(results.P_x[edge]);
         __m512 edge_p_y = load_ps(results.P_y[edge]);
@@ -872,7 +943,7 @@ static void check_vertex_projection_batch16_avx512(
     store_ps(dist, cur_dist);
 }
 
-// ========== 主函数 ==========
+// ========== 主函数（添加数据预取） ==========
 void TriDistBatch16(
     PQP_REAL p_batch[16][3],
     PQP_REAL q_batch[16][3],
@@ -880,10 +951,14 @@ void TriDistBatch16(
     const PQP_REAL s_batch[16][3][3],
     const PQP_REAL t_batch[16][3][3])
 {
-    TriangleBatch16 batch;
+    // 确保局部结构体按64字节对齐
+    alignas(64) TriangleBatch16 batch;
+    alignas(64) EdgePairResults16 results;
 
+    // 填充batch，并在循环中预取下一组输入数据
     for (int i = 0; i < 16; i++)
     {
+        // 拷贝当前三角形的顶点
         batch.S0_x[i] = s_batch[i][0][0];
         batch.S0_y[i] = s_batch[i][0][1];
         batch.S0_z[i] = s_batch[i][0][2];
@@ -907,25 +982,48 @@ void TriDistBatch16(
         batch.T2_x[i] = t_batch[i][2][0];
         batch.T2_y[i] = t_batch[i][2][1];
         batch.T2_z[i] = t_batch[i][2][2];
+
+        // 预取下一个三角形的输入数据（如果有）
+        if (i + 1 < 16)
+        {
+            _mm_prefetch((const char *)&s_batch[i + 1][0][0], _MM_HINT_T0);
+            _mm_prefetch((const char *)&t_batch[i + 1][0][0], _MM_HINT_T0);
+        }
     }
+
+    // 预取整个batch结构体，确保后续计算数据已在缓存
+    _mm_prefetch((const char *)&batch, _MM_HINT_T0);
 
     compute_edge_vectors_batch16(batch);
 
-    EdgePairResults16 results;
-
+    // 计算9对边（可以改为循环，但保留手动调用以便预取）
+    // 在每个调用前预取下一边所需的数据
     compute_edge_pair_batch16_avx512(results, 0, batch, 0, 0);
+    _mm_prefetch((const char *)&batch.Sv0_x, _MM_HINT_T0); // 预取下一对边可能用到的数据
     compute_edge_pair_batch16_avx512(results, 1, batch, 0, 1);
+    _mm_prefetch((const char *)&batch.Sv0_x, _MM_HINT_T0);
     compute_edge_pair_batch16_avx512(results, 2, batch, 0, 2);
+    _mm_prefetch((const char *)&batch.Sv1_x, _MM_HINT_T0);
     compute_edge_pair_batch16_avx512(results, 3, batch, 1, 0);
+    _mm_prefetch((const char *)&batch.Sv1_x, _MM_HINT_T0);
     compute_edge_pair_batch16_avx512(results, 4, batch, 1, 1);
+    _mm_prefetch((const char *)&batch.Sv1_x, _MM_HINT_T0);
     compute_edge_pair_batch16_avx512(results, 5, batch, 1, 2);
+    _mm_prefetch((const char *)&batch.Sv2_x, _MM_HINT_T0);
     compute_edge_pair_batch16_avx512(results, 6, batch, 2, 0);
+    _mm_prefetch((const char *)&batch.Sv2_x, _MM_HINT_T0);
     compute_edge_pair_batch16_avx512(results, 7, batch, 2, 1);
+    _mm_prefetch((const char *)&batch.Sv2_x, _MM_HINT_T0);
     compute_edge_pair_batch16_avx512(results, 8, batch, 2, 2);
 
-    float P_x[16], P_y[16], P_z[16];
-    float Q_x[16], Q_y[16], Q_z[16];
-    int shown_disjoint[16];
+    // 对齐的临时数组（使用单独的声明）
+    alignas(64) float P_x[16];
+    alignas(64) float P_y[16];
+    alignas(64) float P_z[16];
+    alignas(64) float Q_x[16];
+    alignas(64) float Q_y[16];
+    alignas(64) float Q_z[16];
+    alignas(64) int shown_disjoint[16];
     select_best_points_batch16_avx512(results, P_x, P_y, P_z, Q_x, Q_y, Q_z, dist, shown_disjoint);
 
     check_vertex_projection_batch16_avx512(batch, P_x, P_y, P_z, Q_x, Q_y, Q_z, dist, shown_disjoint);
@@ -976,6 +1074,7 @@ void TriDistBatch8(
 PQP_REAL TriDist(PQP_REAL P[3], PQP_REAL Q[3],
                  const PQP_REAL S[3][3], const PQP_REAL T[3][3])
 {
+    // 此部分未修改，保持原样
     // 计算边向量
     PQP_REAL Sv[3][3], Tv[3][3];
     for (int i = 0; i < 3; i++)
