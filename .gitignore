@@ -1,0 +1,14 @@
+# Visual Studio
+.vs/
+*.user
+x64/
+Debug/
+Release/
+*.vcxproj.user
+
+# 编译产物
+*.exe
+*.obj
+*.o
+*.zip
+logs-*.zip
