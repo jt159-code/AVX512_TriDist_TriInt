@@ -1,0 +1,35 @@
+{
+    "workbench.colorCustomizations": {
+        "sideBar.border": "#DFE5EF",
+        "sideBar.background": "#fefefe"
+    },
+    "editor.tokenColorCustomizations": {
+        "textMateRules": [
+            {
+                "scope": "kunpeng.func",
+                "settings": {
+                    "foreground": "#28a745"
+                }
+            },
+            {
+                "scope": "kunpeng.intrinsics",
+                "settings": {
+                    "foreground": "#28a745"
+                }
+            },
+            {
+                "scope": "kunpeng.builtIn",
+                "settings": {
+                    "foreground": "#28a745"
+                }
+            }
+        ]
+    },
+    "files.associations": {
+        "*.dbclient-js": "javascript",
+        "array": "cpp",
+        "string": "cpp",
+        "string_view": "cpp",
+        "chrono": "cpp"
+    }
+}
