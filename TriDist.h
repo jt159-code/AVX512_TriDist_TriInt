@@ -1,41 +1,6 @@
 /*************************************************************************\
-
   Copyright 1999 The University of North Carolina at Chapel Hill.
   All Rights Reserved.
-
-  Permission to use, copy, modify and distribute this software and its
-  documentation for educational, research and non-profit purposes, without
-  fee, and without a written agreement is hereby granted, provided that the
-  above copyright notice and the following three paragraphs appear in all
-  copies.
-
-  IN NO EVENT SHALL THE UNIVERSITY OF NORTH CAROLINA AT CHAPEL HILL BE
-  LIABLE TO ANY PARTY FOR DIRECT, INDIRECT, SPECIAL, INCIDENTAL, OR
-  CONSEQUENTIAL DAMAGES, INCLUDING LOST PROFITS, ARISING OUT OF THE
-  USE OF THIS SOFTWARE AND ITS DOCUMENTATION, EVEN IF THE UNIVERSITY
-  OF NORTH CAROLINA HAVE BEEN ADVISED OF THE POSSIBILITY OF SUCH
-  DAMAGES.
-
-  THE UNIVERSITY OF NORTH CAROLINA SPECIFICALLY DISCLAIM ANY
-  WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
-  MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE.  THE SOFTWARE
-  PROVIDED HEREUNDER IS ON AN "AS IS" BASIS, AND THE UNIVERSITY OF
-  NORTH CAROLINA HAS NO OBLIGATIONS TO PROVIDE MAINTENANCE, SUPPORT,
-  UPDATES, ENHANCEMENTS, OR MODIFICATIONS.
-
-  The authors may be contacted via:
-
-  US Mail:             E. Larsen
-                       Department of Computer Science
-                       Sitterson Hall, CB #3175
-                       University of N. Carolina
-                       Chapel Hill, NC 27599-3175
-
-  Phone:               (919)962-1749
-
-  EMail:               geom@cs.unc.edu
-
-
 \**************************************************************************/
 
 #ifndef PQP_TRIDIST_H
@@ -43,21 +8,28 @@
 
 #include "PQP_Compile.h"
 
-// TriDist()
-//
-// computes the closest points on two triangles, and returns the 
-// distance between them.
-// 
-// s and t are the triangles, stored tri[point][dimension].
-//
-// If the triangles are disjoint, p and q give the closest points of 
-// s and t respectively. However, if the triangles overlap, p and q 
-// are basically a random pair of points from the triangles, not 
-// coincident points on the intersection of the triangles, as might 
-// be expected.
-
-PQP_REAL 
-TriDist(PQP_REAL p[3], PQP_REAL q[3], 
+// 单个三角形对的距离计算 (保持原接口兼容)
+PQP_REAL
+TriDist(PQP_REAL p[3], PQP_REAL q[3],
         const PQP_REAL s[3][3], const PQP_REAL t[3][3]);
+
+// ========== 批量处理接口：同时计算16对三角形 ==========
+// 输入: s_batch[16][3][3], t_batch[16][3][3] - 16对三角形
+// 输出: p_batch[16][3], q_batch[16][3] - 16对最近点
+// 返回: dist[16] - 16个距离值
+void TriDistBatch16(
+    PQP_REAL p_batch[16][3],
+    PQP_REAL q_batch[16][3],
+    PQP_REAL dist[16],
+    const PQP_REAL s_batch[16][3][3],
+    const PQP_REAL t_batch[16][3][3]);
+
+// 为了方便处理非16倍数的数据，提供8对版本
+void TriDistBatch8(
+    PQP_REAL p_batch[8][3],
+    PQP_REAL q_batch[8][3],
+    PQP_REAL dist[8],
+    const PQP_REAL s_batch[8][3][3],
+    const PQP_REAL t_batch[8][3][3]);
 
 #endif
