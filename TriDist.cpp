@@ -244,23 +244,22 @@ static void SegPointsBatch16_avx512(
     const float *Q_x, const float *Q_y, const float *Q_z,
     const float *B_x, const float *B_y, const float *B_z)
 {
-    // 所有临时数组均按64字节对齐
-    alignas(64) float T_x[16], T_y[16], T_z[16];
+    // 所有临时数组按64字节对齐
     alignas(64) float A_dot_A[16], B_dot_B[16], A_dot_B[16], A_dot_T[16], B_dot_T[16];
     alignas(64) float denom[16];
+    alignas(64) float T_x[16], T_y[16], T_z[16];
 
     // 计算 T = Q - P
     vec_sub_batch16_avx512(T_x, T_y, T_z, Q_x, Q_y, Q_z, P_x, P_y, P_z);
 
     // 计算点积
-    // 批量点积？
     dotprod_batch16_avx512(A_dot_A, A_x, A_y, A_z, A_x, A_y, A_z);
     dotprod_batch16_avx512(B_dot_B, B_x, B_y, B_z, B_x, B_y, B_z);
     dotprod_batch16_avx512(A_dot_B, A_x, A_y, A_z, B_x, B_y, B_z);
     dotprod_batch16_avx512(A_dot_T, A_x, A_y, A_z, T_x, T_y, T_z);
     dotprod_batch16_avx512(B_dot_T, B_x, B_y, B_z, T_x, T_y, T_z);
 
-    // 计算分母denom = (A·A)*(B·B) - (A·B)^2
+    // 计算分母 denom = (A·A)*(B·B) - (A·B)^2
     {
         __m512 a_dot_a = load_ps(A_dot_A);
         __m512 b_dot_b = load_ps(B_dot_B);
@@ -269,19 +268,19 @@ static void SegPointsBatch16_avx512(
         store_ps(denom, den);
     }
 
-    // 将所需数据全部加载到寄存器，避免重复从内存加载，提高效率
+    // 将所有数据加载到寄存器
     __m512 p_x = load_ps(P_x);
     __m512 p_y = load_ps(P_y);
     __m512 p_z = load_ps(P_z);
-    __m512 a_x_v = load_ps(A_x);
-    __m512 a_y_v = load_ps(A_y);
-    __m512 a_z_v = load_ps(A_z);
+    __m512 a_x = load_ps(A_x);
+    __m512 a_y = load_ps(A_y);
+    __m512 a_z = load_ps(A_z);
     __m512 q_x = load_ps(Q_x);
     __m512 q_y = load_ps(Q_y);
     __m512 q_z = load_ps(Q_z);
-    __m512 b_x_v = load_ps(B_x);
-    __m512 b_y_v = load_ps(B_y);
-    __m512 b_z_v = load_ps(B_z);
+    __m512 b_x = load_ps(B_x);
+    __m512 b_y = load_ps(B_y);
+    __m512 b_z = load_ps(B_z);
 
     __m512 a_dot_a = load_ps(A_dot_A);
     __m512 b_dot_b = load_ps(B_dot_B);
@@ -290,184 +289,229 @@ static void SegPointsBatch16_avx512(
     __m512 b_dot_t = load_ps(B_dot_T);
     __m512 den = load_ps(denom);
 
-    // 常用常量和极小值（用于判断退化）
+    // 常用常量和极小值
     __m512 zero = _mm512_setzero_ps();
     __m512 one = _mm512_set1_ps(1.0f);
     __m512 eps = _mm512_set1_ps(1e-15f);
 
     // 检测退化情况
-    // 去掉符号位:无分支，流水线友好
     __m512 den_abs = _mm512_castsi512_ps(_mm512_and_si512(_mm512_castps_si512(den), _mm512_set1_epi32(0x7FFFFFFF)));
     __mmask16 degen_mask = _mm512_cmp_ps_mask(den_abs, eps, _CMP_LT_OS);
 
-    // 计算正常情况的t和u：如果用掩码来避免退化元素参与除法，需要额外的条件加载或掩码操作，会增加代码复杂度
-    // 除法是否可以优化？
+    // 计算正常情况的 t 和 u
     __m512 t_num = _mm512_fmsub_ps(a_dot_t, b_dot_b, _mm512_mul_ps(b_dot_t, a_dot_b));
     __m512 t_normal = _mm512_div_ps(t_num, den);
-    __m512 u_num = _mm512_fmsub_ps(t_normal, a_dot_b, b_dot_t);
-    __m512 u_normal = _mm512_div_ps(u_num, b_dot_b);
+    __m512 u_normal = _mm512_div_ps(_mm512_fmsub_ps(t_normal, a_dot_b, b_dot_t), b_dot_b);
 
-    // 初始化t和u
-    __m512 t = t_normal;
-    __m512 u = u_normal;
+    __m512 t, u;
 
-    // 处理退化情况（使用标量回退，因为退化情况很少）
-    """
-    当前代码的问题
-    退化情况极少：在实际应用中，退化三角形（面积为0）或平行线段的情况非常罕见，通常不到1%
-    过度向量化的开销：
-    即使退化情况很少，代码仍然为所有16个元素计算了4个端点的
-    这些计算在非退化元素上是浪费的
-    掩码操作虽然避免了存储，但计算仍然执行了
-    更好的策略：对于极少数退化情况，标量回退可能更快，因为：
-    避免了为所有元素计算不必要的端点距离
-    减少了向量指令的开销
-    更简单的代码路径
-    """
+    // 处理退化情况（使用AVX512批量处理）
     if (degen_mask != 0)
     {
-        alignas(64) float t_vals[16], u_vals[16];
-        _mm512_store_ps(t_vals, t_normal);
-        _mm512_store_ps(u_vals, u_normal);
+        // 计算4个端点的所有组合
+        // 端点0: (t=0, u=0) -> P, Q
+        __m512 p0_x = p_x;
+        __m512 p0_y = p_y;
+        __m512 p0_z = p_z;
+        __m512 q0_x = q_x;
+        __m512 q0_y = q_y;
+        __m512 q0_z = q_z;
 
-        for (int i = 0; i < 16; i++)
+        // 端点1: (t=0, u=1) -> P, Q+B
+        __m512 p1_x = p_x;
+        __m512 p1_y = p_y;
+        __m512 p1_z = p_z;
+        __m512 q1_x = _mm512_add_ps(q_x, b_x);
+        __m512 q1_y = _mm512_add_ps(q_y, b_y);
+        __m512 q1_z = _mm512_add_ps(q_z, b_z);
+
+        // 端点2: (t=1, u=0) -> P+A, Q
+        __m512 p2_x = _mm512_add_ps(p_x, a_x);
+        __m512 p2_y = _mm512_add_ps(p_y, a_y);
+        __m512 p2_z = _mm512_add_ps(p_z, a_z);
+        __m512 q2_x = q_x;
+        __m512 q2_y = q_y;
+        __m512 q2_z = q_z;
+
+        // 端点3: (t=1, u=1) -> P+A, Q+B
+        __m512 p3_x = _mm512_add_ps(p_x, a_x);
+        __m512 p3_y = _mm512_add_ps(p_y, a_y);
+        __m512 p3_z = _mm512_add_ps(p_z, a_z);
+        __m512 q3_x = _mm512_add_ps(q_x, b_x);
+        __m512 q3_y = _mm512_add_ps(q_y, b_y);
+        __m512 q3_z = _mm512_add_ps(q_z, b_z);
+
+        // 计算4个距离平方
+        __m512 dx0 = _mm512_sub_ps(q0_x, p0_x);
+        __m512 dy0 = _mm512_sub_ps(q0_y, p0_y);
+        __m512 dz0 = _mm512_sub_ps(q0_z, p0_z);
+        __m512 d2_0 = _mm512_fmadd_ps(dx0, dx0, _mm512_fmadd_ps(dy0, dy0, _mm512_mul_ps(dz0, dz0)));
+
+        __m512 dx1 = _mm512_sub_ps(q1_x, p1_x);
+        __m512 dy1 = _mm512_sub_ps(q1_y, p1_y);
+        __m512 dz1 = _mm512_sub_ps(q1_z, p1_z);
+        __m512 d2_1 = _mm512_fmadd_ps(dx1, dx1, _mm512_fmadd_ps(dy1, dy1, _mm512_mul_ps(dz1, dz1)));
+
+        __m512 dx2 = _mm512_sub_ps(q2_x, p2_x);
+        __m512 dy2 = _mm512_sub_ps(q2_y, p2_y);
+        __m512 dz2 = _mm512_sub_ps(q2_z, p2_z);
+        __m512 d2_2 = _mm512_fmadd_ps(dx2, dx2, _mm512_fmadd_ps(dy2, dy2, _mm512_mul_ps(dz2, dz2)));
+
+        __m512 dx3 = _mm512_sub_ps(q3_x, p3_x);
+        __m512 dy3 = _mm512_sub_ps(q3_y, p3_y);
+        __m512 dz3 = _mm512_sub_ps(q3_z, p3_z);
+        __m512 d2_3 = _mm512_fmadd_ps(dx3, dx3, _mm512_fmadd_ps(dy3, dy3, _mm512_mul_ps(dz3, dz3)));
+
+        // 初始化最佳距离和最佳参数
+        __m512 best_dist2 = d2_0;
+        __m512 best_t = zero;
+        __m512 best_u = zero;
+
+        // 比较并更新端点1 (t=0, u=1)
+        __mmask16 mask1 = _mm512_cmp_ps_mask(d2_1, best_dist2, _CMP_LT_OS);
+        best_dist2 = _mm512_mask_mov_ps(best_dist2, mask1, d2_1);
+        best_t = _mm512_mask_mov_ps(best_t, mask1, zero);
+        best_u = _mm512_mask_mov_ps(best_u, mask1, one);
+
+        // 比较并更新端点2 (t=1, u=0)
+        __mmask16 mask2 = _mm512_cmp_ps_mask(d2_2, best_dist2, _CMP_LT_OS);
+        best_dist2 = _mm512_mask_mov_ps(best_dist2, mask2, d2_2);
+        best_t = _mm512_mask_mov_ps(best_t, mask2, one);
+        best_u = _mm512_mask_mov_ps(best_u, mask2, zero);
+
+        // 比较并更新端点3 (t=1, u=1)
+        __mmask16 mask3 = _mm512_cmp_ps_mask(d2_3, best_dist2, _CMP_LT_OS);
+        best_dist2 = _mm512_mask_mov_ps(best_dist2, mask3, d2_3);
+        best_t = _mm512_mask_mov_ps(best_t, mask3, one);
+        best_u = _mm512_mask_mov_ps(best_u, mask3, one);
+
+        // 对于退化元素使用最佳参数，非退化元素使用正常计算的参数
+        t = _mm512_mask_mov_ps(t_normal, degen_mask, best_t);
+        u = _mm512_mask_mov_ps(u_normal, degen_mask, best_u);
+
+        // 对于非退化元素进行边界约束
+        __mmask16 non_degen_mask = _mm512_knot(degen_mask);
+        if (non_degen_mask != 0)
         {
-            if ((degen_mask >> i) & 1)
+            // 处理 t 边界
+            __mmask16 t_lower = _mm512_cmp_ps_mask(t, zero, _CMP_LT_OS);
+            __mmask16 t_upper = _mm512_cmp_ps_mask(t, one, _CMP_GT_OS);
+            __mmask16 t_bound_mask = _mm512_kor(t_lower, t_upper);
+            t_bound_mask = _mm512_kand(t_bound_mask, non_degen_mask);
+
+            if (t_bound_mask != 0)
             {
-                // 退化情况：比较4个端点，找到最近点对
-                // 这里有必要AVX512吗？->继续加速
-                float best_dist2 = FLT_MAX;
-                float best_t = 0, best_u = 0;
+                // 安全的 B·B
+                __m512 b_dot_b_abs = _mm512_castsi512_ps(_mm512_and_si512(_mm512_castps_si512(b_dot_b),
+                                                                          _mm512_set1_epi32(0x7FFFFFFF)));
+                __m512 b_dot_b_safe = _mm512_mask_mov_ps(b_dot_b,
+                                                         _mm512_cmp_ps_mask(b_dot_b_abs, eps, _CMP_LT_OS),
+                                                         one);
 
-                for (int ti = 0; ti <= 1; ti++)
-                {
-                    for (int ui = 0; ui <= 1; ui++)
-                    {
+                // t < 0 的情况
+                __m512 u_new_t0 = _mm512_div_ps(_mm512_sub_ps(zero, b_dot_t), b_dot_b_safe);
+                u = _mm512_mask_mov_ps(u, _mm512_kand(t_lower, non_degen_mask), u_new_t0);
+                t = _mm512_mask_mov_ps(t, _mm512_kand(t_lower, non_degen_mask), zero);
 
-                        float px = P_x[i] + A_x[i] * ti;
-                        float py = P_y[i] + A_y[i] * ti;
-                        float pz = P_z[i] + A_z[i] * ti;
-                        float qx = Q_x[i] + B_x[i] * ui;
-                        float qy = Q_y[i] + B_y[i] * ui;
-                        float qz = Q_z[i] + B_z[i] * ui;
-                        float d2 = (px - qx) * (px - qx) + (py - qy) * (py - qy) + (pz - qz) * (pz - qz);
-                        if (d2 < best_dist2)
-                        {
-                            best_dist2 = d2;
-                            best_t = (float)ti;
-                            best_u = (float)ui;
-                        }
-                    }
-                }
-                t_vals[i] = best_t;
-                u_vals[i] = best_u;
+                // t > 1 的情况
+                __m512 u_new_t1 = _mm512_div_ps(_mm512_sub_ps(a_dot_b, b_dot_t), b_dot_b_safe);
+                u = _mm512_mask_mov_ps(u, _mm512_kand(t_upper, non_degen_mask), u_new_t1);
+                t = _mm512_mask_mov_ps(t, _mm512_kand(t_upper, non_degen_mask), one);
             }
-            else
+
+            // 处理 u 边界
+            __mmask16 u_lower = _mm512_cmp_ps_mask(u, zero, _CMP_LT_OS);
+            __mmask16 u_upper = _mm512_cmp_ps_mask(u, one, _CMP_GT_OS);
+            __mmask16 u_bound_mask = _mm512_kor(u_lower, u_upper);
+            u_bound_mask = _mm512_kand(u_bound_mask, non_degen_mask);
+
+            if (u_bound_mask != 0)
             {
-                // 非退化情况：先约束 t
-                float t = t_vals[i];
-                float u = u_vals[i];
+                // 安全的 A·A
+                __m512 a_dot_a_abs = _mm512_castsi512_ps(_mm512_and_si512(_mm512_castps_si512(a_dot_a),
+                                                                          _mm512_set1_epi32(0x7FFFFFFF)));
+                __m512 a_dot_a_safe = _mm512_mask_mov_ps(a_dot_a,
+                                                         _mm512_cmp_ps_mask(a_dot_a_abs, eps, _CMP_LT_OS),
+                                                         one);
 
-                // 约束 t 到 [0, 1]
-                if (t < 0)
-                {
-                    t = 0;
-                    if (fabs(B_dot_B[i]) > 1e-15f)
-                        u = -B_dot_T[i] / B_dot_B[i];
-                }
-                else if (t > 1)
-                {
-                    t = 1;
-                    if (fabs(B_dot_B[i]) > 1e-15f)
-                        u = (A_dot_B[i] - B_dot_T[i]) / B_dot_B[i];
-                }
+                // u < 0 的情况
+                __m512 t_new_u0 = _mm512_div_ps(a_dot_t, a_dot_a_safe);
+                t_new_u0 = _mm512_min_ps(_mm512_max_ps(t_new_u0, zero), one);
+                t = _mm512_mask_mov_ps(t, _mm512_kand(u_lower, non_degen_mask), t_new_u0);
+                u = _mm512_mask_mov_ps(u, _mm512_kand(u_lower, non_degen_mask), zero);
 
-                // 约束 u 到 [0, 1]
-                if (u < 0)
-                {
-                    u = 0;
-                    if (fabs(A_dot_A[i]) > 1e-15f) // 安全的A·A
-                        t = A_dot_T[i] / A_dot_A[i];
-                    if (t < 0)
-                        t = 0;
-                    if (t > 1)
-                        t = 1;
-                }
-                else if (u > 1)
-                {
-                    u = 1;
-                    if (fabs(A_dot_A[i]) > 1e-15f)
-                        t = (A_dot_T[i] + A_dot_B[i]) / A_dot_A[i];
-                    if (t < 0)
-                        t = 0;
-                    if (t > 1)
-                        t = 1;
-                }
-
-                t_vals[i] = t;
-                u_vals[i] = u;
+                // u > 1 的情况
+                __m512 t_new_u1 = _mm512_div_ps(_mm512_add_ps(a_dot_t, a_dot_b), a_dot_a_safe);
+                t_new_u1 = _mm512_min_ps(_mm512_max_ps(t_new_u1, zero), one);
+                t = _mm512_mask_mov_ps(t, _mm512_kand(u_upper, non_degen_mask), t_new_u1);
+                u = _mm512_mask_mov_ps(u, _mm512_kand(u_upper, non_degen_mask), one);
             }
         }
 
-        t = load_ps(t_vals);
-        u = load_ps(u_vals);
+        // 最终截断
+        t = _mm512_min_ps(_mm512_max_ps(t, zero), one);
+        u = _mm512_min_ps(_mm512_max_ps(u, zero), one);
     }
     else
     {
-        // 非退化情况：批量处理边界约束
-        // 目标函数（距离平方）是凸函数，其最小值在矩形域 [0,1]×[0,1] 上的投影必然落在边界上
-        // 约束参数（与标量逻辑一致）
-        // 首先处理 t 的边界情况
-        __mmask16 t_lower = _mm512_cmp_ps_mask(t, zero, _CMP_LT_OS);
-        __mmask16 t_upper = _mm512_cmp_ps_mask(t, one, _CMP_GT_OS);
+        // 非退化情况：直接处理边界约束
+        // 处理 t 边界
+        __mmask16 t_lower = _mm512_cmp_ps_mask(t_normal, zero, _CMP_LT_OS);
+        __mmask16 t_upper = _mm512_cmp_ps_mask(t_normal, one, _CMP_GT_OS);
 
-        // 当 t < 0 时，t = 0，重新计算 u
-        // 安全的B·B：这种情况实际对应线段退化为点，最优参数通常应为 0 或 1（边界），而安全版本计算出的参数可能偏离，但随后会被 clamp 到 [0,1]，最终结果可能仍然是边界值。此外，后续的顶点投影测试（check_vertex_projection_batch16_avx512）会检查三角形顶点到对面平面的投影，可能再次修正最近点，从而弥补误差。
+        __m512 b_dot_b_abs = _mm512_castsi512_ps(_mm512_and_si512(_mm512_castps_si512(b_dot_b),
+                                                                  _mm512_set1_epi32(0x7FFFFFFF)));
         __m512 b_dot_b_safe = _mm512_mask_mov_ps(b_dot_b,
-                                                 _mm512_cmp_ps_mask(_mm512_castsi512_ps(_mm512_and_si512(_mm512_castps_si512(b_dot_b), _mm512_set1_epi32(0x7FFFFFFF))), eps, _CMP_LT_OS),
-                                                 _mm512_set1_ps(1.0f)); // 避免除以零
+                                                 _mm512_cmp_ps_mask(b_dot_b_abs, eps, _CMP_LT_OS),
+                                                 one);
+
         __m512 u_new_t0 = _mm512_div_ps(_mm512_sub_ps(zero, b_dot_t), b_dot_b_safe);
+        __m512 u_new_t1 = _mm512_div_ps(_mm512_sub_ps(a_dot_b, b_dot_t), b_dot_b_safe);
+
+        t = t_normal;
+        u = u_normal;
+
         u = _mm512_mask_mov_ps(u, t_lower, u_new_t0);
         t = _mm512_mask_mov_ps(t, t_lower, zero);
 
-        // 当 t > 1 时，t = 1，重新计算 u
-        __m512 u_new_t1 = _mm512_div_ps(_mm512_sub_ps(a_dot_b, b_dot_t), b_dot_b_safe);
         u = _mm512_mask_mov_ps(u, t_upper, u_new_t1);
         t = _mm512_mask_mov_ps(t, t_upper, one);
 
-        // 然后处理 u 的边界情况
+        // 处理 u 边界
         __mmask16 u_lower = _mm512_cmp_ps_mask(u, zero, _CMP_LT_OS);
         __mmask16 u_upper = _mm512_cmp_ps_mask(u, one, _CMP_GT_OS);
 
-        // 当 u < 0 时，u = 0，重新计算 t
-        // _mm512_abs_ps 可能未被定义（尽管AVX512指令集支持）？
+        __m512 a_dot_a_abs = _mm512_castsi512_ps(_mm512_and_si512(_mm512_castps_si512(a_dot_a),
+                                                                  _mm512_set1_epi32(0x7FFFFFFF)));
         __m512 a_dot_a_safe = _mm512_mask_mov_ps(a_dot_a,
-                                                 _mm512_cmp_ps_mask(_mm512_castsi512_ps(_mm512_and_si512(_mm512_castps_si512(a_dot_a), _mm512_set1_epi32(0x7FFFFFFF))), eps, _CMP_LT_OS),
-                                                 _mm512_set1_ps(1.0f)); // 避免除以零
+                                                 _mm512_cmp_ps_mask(a_dot_a_abs, eps, _CMP_LT_OS),
+                                                 one);
+
         __m512 t_new_u0 = _mm512_div_ps(a_dot_t, a_dot_a_safe);
         t_new_u0 = _mm512_min_ps(_mm512_max_ps(t_new_u0, zero), one);
+
+        __m512 t_new_u1 = _mm512_div_ps(_mm512_add_ps(a_dot_t, a_dot_b), a_dot_a_safe);
+        t_new_u1 = _mm512_min_ps(_mm512_max_ps(t_new_u1, zero), one);
+
         t = _mm512_mask_mov_ps(t, u_lower, t_new_u0);
         u = _mm512_mask_mov_ps(u, u_lower, zero);
 
-        // 当 u > 1 时，u = 1，重新计算 t
-        __m512 t_new_u1 = _mm512_div_ps(_mm512_add_ps(a_dot_t, a_dot_b), a_dot_a_safe);
-        t_new_u1 = _mm512_min_ps(_mm512_max_ps(t_new_u1, zero), one);
         t = _mm512_mask_mov_ps(t, u_upper, t_new_u1);
         u = _mm512_mask_mov_ps(u, u_upper, one);
+
+        // 最终截断
+        t = _mm512_min_ps(_mm512_max_ps(t, zero), one);
+        u = _mm512_min_ps(_mm512_max_ps(u, zero), one);
     }
 
-    // 最终截断（确保在 [0,1] 范围内）
-    __m512 t_clamped = _mm512_min_ps(_mm512_max_ps(t, zero), one);
-    __m512 u_clamped = _mm512_min_ps(_mm512_max_ps(u, zero), one);
-
     // 计算最近点
-    __m512 x_x = _mm512_fmadd_ps(a_x_v, t_clamped, p_x);
-    __m512 x_y = _mm512_fmadd_ps(a_y_v, t_clamped, p_y);
-    __m512 x_z = _mm512_fmadd_ps(a_z_v, t_clamped, p_z);
+    __m512 x_x = _mm512_fmadd_ps(a_x, t, p_x);
+    __m512 x_y = _mm512_fmadd_ps(a_y, t, p_y);
+    __m512 x_z = _mm512_fmadd_ps(a_z, t, p_z);
 
-    __m512 y_x = _mm512_fmadd_ps(b_x_v, u_clamped, q_x);
-    __m512 y_y = _mm512_fmadd_ps(b_y_v, u_clamped, q_y);
-    __m512 y_z = _mm512_fmadd_ps(b_z_v, u_clamped, q_z);
+    __m512 y_x = _mm512_fmadd_ps(b_x, u, q_x);
+    __m512 y_y = _mm512_fmadd_ps(b_y, u, q_y);
+    __m512 y_z = _mm512_fmadd_ps(b_z, u, q_z);
 
     __m512 vec_x = _mm512_sub_ps(y_x, x_x);
     __m512 vec_y = _mm512_sub_ps(y_y, x_y);
